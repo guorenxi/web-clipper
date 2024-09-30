@@ -1,12 +1,12 @@
-import { CompleteStatus, UnauthorizedError } from './../interface';
-import { DocumentService, CreateDocumentRequest } from '../../index';
-import axios, { AxiosInstance } from 'axios';
-import { generateUuid } from '@web-clipper/shared/lib/uuid';
 import localeService from '@/common/locales';
-import { NotionRepository, NotionUserContent } from './types';
-import { IWebRequestService } from '@/service/common/webRequest';
-import Container from 'typedi';
 import { ICookieService } from '@/service/common/cookie';
+import { IWebRequestService } from '@/service/common/webRequest';
+import { generateUuid } from '@web-clipper/shared/lib/uuid';
+import axios, { AxiosInstance } from 'axios';
+import Container from 'typedi';
+import { CreateDocumentRequest, DocumentService } from '../../index';
+import { CompleteStatus, UnauthorizedError } from './../interface';
+import { NotionRepository, NotionUserContent, RecentPages } from './types';
 
 const PAGE = 'page';
 const COLLECTION_VIEW_PAGE = 'collection_view_page';
@@ -35,8 +35,8 @@ export default class NotionDocumentService implements DocumentService {
     this.webRequestService = Container.get(IWebRequestService);
     this.cookieService = Container.get(ICookieService);
     this.request.interceptors.response.use(
-      r => r,
-      error => {
+      (r) => r,
+      (error) => {
         if (error.response && error.response.status === 401) {
           return Promise.reject(
             new UnauthorizedError(
@@ -62,9 +62,9 @@ export default class NotionDocumentService implements DocumentService {
     }
     const user = this.userContent.recordMap.notion_user;
     const userInfo = Object.values(user)[0];
-    const { email, profile_photo, given_name, family_name } = userInfo.value;
+    const { email, profile_photo, name } = userInfo.value;
     return {
-      name: `${given_name}${family_name}`,
+      name,
       avatar: profile_photo,
       homePage: 'https://www.notion.so/',
       description: email,
@@ -77,52 +77,19 @@ export default class NotionDocumentService implements DocumentService {
     }
 
     const spaces = this.userContent.recordMap.space;
-    const blocks = this.userContent.recordMap.block;
-    const collections = this.userContent.recordMap.collection;
 
-    if (!blocks) {
-      this.repositories = [];
-      return [];
-    }
+    const userId = Object.keys(this.userContent.recordMap.notion_user)[0] as string;
 
-    const result: NotionRepository[] = [];
-    Object.values(blocks).forEach(({ value }) => {
-      if (
-        value.type === PAGE &&
-        !!value.properties &&
-        !!value.properties.title &&
-        !!spaces[value.parent_id]
-      ) {
-        result.push({
-          id: value.id,
-          name: value.properties.title.toString(),
-          groupId: spaces[value.parent_id].value.domain,
-          groupName: spaces[value.parent_id].value.name,
-          pageType: PAGE,
-        });
-      }
+    const result: Array<NotionRepository[]> = await Promise.all(
+      Object.keys(spaces).map(async (p) => {
+        const space = spaces[p];
+        const recentPages = await this.getRecentPageVisits(space.value.id, userId);
+        return this.loadSpace(p, space.value.name, recentPages);
+      })
+    );
 
-      if (
-        value.type === COLLECTION_VIEW_PAGE &&
-        !!value.collection_id &&
-        !!collections[value.collection_id] &&
-        !!collections[value.collection_id].value &&
-        !!collections[value.collection_id].value.name &&
-        !!spaces[value.parent_id]
-      ) {
-        result.push({
-          id: collections[value.collection_id].value.id,
-          name: collections[value.collection_id].value.name.toString(),
-          groupId: spaces[value.parent_id].value.domain,
-          groupName: spaces[value.parent_id].value.name,
-          pageType: COLLECTION_VIEW_PAGE,
-        });
-      }
-    });
-
-    this.repositories = result;
-
-    return result;
+    this.repositories = result.flat() as NotionRepository[];
+    return this.repositories;
   };
 
   createDocument = async ({
@@ -132,18 +99,22 @@ export default class NotionDocumentService implements DocumentService {
   }: CreateDocumentRequest): Promise<CompleteStatus> => {
     let fileName = `${title}.md`;
 
-    const repository = this.repositories.find(o => o.id === repositoryId);
+    const repository = this.repositories.find((o) => o.id === repositoryId);
     if (!repository) {
       throw new Error('Illegal repository');
     }
 
     const documentId = await this.createEmptyFile(repository, content);
-    const fileUrl = await this.getFileUrl(fileName);
+    const fileUrl = await this.getFileUrl(encodeURI(fileName));
     await axios.put(fileUrl.signedPutUrl, `${content}`, {
       headers: {
         'Content-Type': 'text/markdown',
       },
     });
+    if (!this.userContent) {
+      this.userContent = await this.getUserContent();
+    }
+    const spaceId = Object.values(this.userContent.recordMap.space)[0].value.id;
     await this.requestWithCookie.post('api/v3/enqueueTask', {
       task: {
         eventName: 'importFile',
@@ -151,7 +122,11 @@ export default class NotionDocumentService implements DocumentService {
           fileURL: fileUrl.url,
           fileName,
           importType: 'ReplaceBlock',
-          pageId: documentId,
+          block: {
+            id: documentId,
+            spaceId: spaceId,
+          },
+          spaceId: spaceId,
         },
       },
     });
@@ -165,6 +140,7 @@ export default class NotionDocumentService implements DocumentService {
     if (!this.userContent) {
       this.userContent = await this.getUserContent();
     }
+    const spaceId = Object.values(this.userContent.recordMap.space)[0].value.id;
     const documentId = generateUuid();
     const parentId = repository.id;
     const userId = Object.values(this.userContent.recordMap.notion_user)[0].value.id;
@@ -180,6 +156,7 @@ export default class NotionDocumentService implements DocumentService {
           args: {
             type: 'page',
             id: documentId,
+            space_id: spaceId,
             version: 1,
           },
         },
@@ -192,6 +169,7 @@ export default class NotionDocumentService implements DocumentService {
             parent_id: parentId,
             parent_table: 'block',
             alive: true,
+            space_id: spaceId,
           },
         },
         {
@@ -199,7 +177,10 @@ export default class NotionDocumentService implements DocumentService {
           id: parentId,
           path: ['content'],
           command: 'listAfter',
-          args: { id: documentId },
+          args: {
+            id: documentId,
+            space_id: spaceId,
+          },
         },
         {
           id: documentId,
@@ -211,6 +192,7 @@ export default class NotionDocumentService implements DocumentService {
             created_time: time,
             last_edited_time: time,
             last_edited_by: userId,
+            space_id: spaceId,
           },
         },
         {
@@ -218,7 +200,10 @@ export default class NotionDocumentService implements DocumentService {
           table: 'block',
           path: [],
           command: 'update',
-          args: { last_edited_time: time },
+          args: {
+            last_edited_time: time,
+            space_id: spaceId,
+          },
         },
         {
           id: documentId,
@@ -232,7 +217,10 @@ export default class NotionDocumentService implements DocumentService {
           table: 'block',
           path: [],
           command: 'update',
-          args: { last_edited_time: time },
+          args: {
+            last_edited_time: time,
+            space_id: spaceId,
+          },
         },
       ];
     } else if (repository.pageType === COLLECTION_VIEW_PAGE) {
@@ -245,6 +233,7 @@ export default class NotionDocumentService implements DocumentService {
           args: {
             type: 'page',
             id: documentId,
+            space_id: spaceId,
             version: 1,
           },
         },
@@ -256,6 +245,7 @@ export default class NotionDocumentService implements DocumentService {
           args: {
             parent_id: parentId,
             parent_table: 'collection',
+            space_id: spaceId,
             alive: true,
           },
         },
@@ -280,6 +270,78 @@ export default class NotionDocumentService implements DocumentService {
     return result.data;
   };
 
+  private async loadSpace(
+    spaceId: string,
+    spaceName: string,
+    recentPages: RecentPages
+  ): Promise<NotionRepository[]> {
+    const response = await this.requestWithCookie.post<{
+      pages: string[];
+      recordMap: {
+        block: {
+          [id: string]: {
+            value: {
+              collection_id: string;
+              id: string;
+              type: string;
+              space_id: string;
+              properties: {
+                title: string[];
+              };
+            };
+          };
+        };
+      };
+    }>('api/v3/getUserSharedPagesInSpace', {
+      includeDeleted: false,
+      includeTeamSharedPages: false,
+      spaceId,
+    });
+
+    const pages: string[] = response.data.pages as string[];
+
+    return pages
+      .map((pageId): NotionRepository | null => {
+        const value = response.data.recordMap.block[pageId]!.value;
+        if (value.type === PAGE && !!value.properties && !!value.properties.title) {
+          return {
+            id: value.id,
+            name: value.properties.title.toString(),
+            groupId: spaceId,
+            groupName: spaceName,
+            pageType: PAGE,
+          };
+        }
+        const collections = recentPages.recordMap.collection;
+        if (
+          value.type === COLLECTION_VIEW_PAGE &&
+          !!value.collection_id &&
+          !!collections &&
+          !!collections[value.collection_id] &&
+          !!collections[value.collection_id].value &&
+          !!collections[value.collection_id].value.name
+        ) {
+          return {
+            id: collections[value.collection_id].value.id,
+            name: collections[value.collection_id].value.name.toString(),
+            groupId: spaceId,
+            groupName: spaceName,
+            pageType: COLLECTION_VIEW_PAGE,
+          };
+        }
+        return null;
+      })
+      .filter((p): p is NotionRepository => !!p);
+  }
+
+  private async getRecentPageVisits(spaceId: string, userId: string): Promise<RecentPages> {
+    const res = await this.requestWithCookie.post<RecentPages>('api/v3/getRecentPageVisits', {
+      spaceId,
+      userId,
+    });
+    return res.data;
+  }
+
   private getUserContent = async () => {
     const response = await this.requestWithCookie.post<NotionUserContent>('api/v3/loadUserContent');
     return response.data;
@@ -293,7 +355,7 @@ export default class NotionDocumentService implements DocumentService {
       const cookies = await this.cookieService.getAll({
         url: origin,
       });
-      const cookieString = cookies.map(o => `${o.name}=${o.value}`).join(';');
+      const cookieString = cookies.map((o) => `${o.name}=${o.value}`).join(';');
       const header = await this.webRequestService.startChangeHeader({
         urls: [`${origin}*`],
         requestHeaders: [
@@ -308,11 +370,11 @@ export default class NotionDocumentService implements DocumentService {
         ],
       });
       try {
-        const result = await this.request.post<T>(url, data, {
-          headers: {
-            [header.name]: header.value,
-          },
-        });
+        const result = await this.request.post<T>(
+          await this.webRequestService.changeUrl(url, header),
+          data,
+          {}
+        );
         await this.webRequestService.end(header);
         return result;
       } catch (error) {
